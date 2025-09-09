@@ -2,7 +2,7 @@
 <html lang="en">
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>Black Cat — Skeleton</title>
+<title>Shadowstep</title>
 <style>
     html,body{margin:0;height:100%;background:#000;overflow:hidden}
     canvas{display:block;touch-action:none}
@@ -31,16 +31,24 @@
     addEventListener('resize', fit, { passive:true });
 
     // ===== Utilities =====
-    const A=Math, Sn=A.sin, Fl=A.floor, Mn=A.min, Mx=A.max, Ab=A.abs;
+    const A=Math, Sn=A.sin, Fl=A.floor, Mn=A.min, Mx=A.max, Ab=A.abs, Cs=A.cos, At=A.atan2;
+    // New level each refresh; same level across resizes.
+    // Optional: pass ?seed=1234 in the URL to reproduce a layout.
+    const LEVEL_SEED = (() => {
+        const q = new URLSearchParams(location.search).get('seed');
+        if (q) return (parseInt(q,10)|0) || 1;
+        try { return (crypto.getRandomValues(new Uint32Array(1))[0] | 0) || 1; }
+        catch { return (Date.now() ^ ((Math.random()*0xFFFFFFFF)|0)) | 0; }
+    })();
+
     const clamp=(x,a,b)=>x<a?a:x>b?b:x;
 
     // Sprite-to-physics alignment
     const BODY_W = 26, BODY_H = 36; // physics hitbox (≈ sprite’s body, not full 50x50)
-    const SPRITE_FOOT_OFFSET = 18;   // you already have this; keep/tweak 0–6
-    const SPRITE_X_OFFSET = 0;     // horizontal nudge in pixels (before scaling). Start at -6, adjust ±
-    const SPRITE_Y_OFFSET = 0;      // extra vertical nudge if needed
-    const DEBUG_SPRITE_ALIGN = false; // set true briefly to visualize
-
+    const SPRITE_FOOT_OFFSET = 18
+    const SPRITE_X_OFFSET = 0;
+    const SPRITE_Y_OFFSET = 0;
+    const DEBUG_SPRITE_ALIGN = false; // turn on if you need to re-align
 
     // Seeded PRNG: xorshift32
     let S=0;
@@ -51,7 +59,7 @@
     // ===== Stars (deterministic) =====
     let stars=[];
     function makeStars(){
-        seed(0xB1AC);
+        seed(LEVEL_SEED);
         const N = 180;
         stars = Array.from({length:N}, ()=>({
             x: rand(0, innerWidth),
@@ -66,25 +74,141 @@
     let world=null;
 
     function genWorld(){
-        seed(0xB1AC ^ 0x1337);
+        seed(LEVEL_SEED);
+        console.log('level seed:', LEVEL_SEED);
         const w = Math.ceil(innerWidth / T) + 32;
         const h = Math.max(28, Math.ceil(innerHeight / T));
         const tiles  = new Uint8Array(w*h);
         const cursed = new Uint16Array(w*h);
-        const emitters = [];
+        let emitters = [];
         const charms = [];
 
-        let y = Fl(h * 0.65);
-        for (let x=0; x<w; x++){
-            if (!(x%4)){
-                const r = R();
-                y = clamp(y + (r<.33?-1 : r<.66?0 : 1), 8, h-6);
+        // === Skyline made of building segments + street gaps ===
+        let x = 0;
+        let roofY = Fl(h * 0.62);                 // starting roof height
+        const roofMin = 6, roofMax = h - 8;       // clamp so we don't hit top/bottom
+
+        while (x < w){
+            // ---- BUILDING segment ----
+            const bW = Fl(rand(22, 10));            // width ~10..22 tiles
+            // cap the inter-building step so it stays jumpable
+            const MAX_STEP_TILES = 6; // try 6; 5 = easier, 7 = harder
+            const delta = ((R() * (2*MAX_STEP_TILES + 1)) | 0) - MAX_STEP_TILES; // -MAX..+MAX
+            roofY = clamp(roofY + delta, roofMin, roofMax);
+
+
+            for (let i=0; i<bW && x<w; i++, x++){
+                // gentle parapet jitter every few tiles to create small steps
+                if (i && !(i % 3)){
+                    roofY = clamp(roofY + (Fl(rand(3,0)) - 1), roofMin, roofMax); // -1..+1
+                }
+                tiles[x + roofY*w] = 1;               // roof cap
+                for (let yy=roofY+1; yy<h; yy++) tiles[x + yy*w] = 2; // solid below
             }
-            tiles[x + y*w] = 1;
-            for (let yy=y+1; yy<h; yy++) tiles[x + yy*w] = 2;
+
+            // ---- STREET gap ---- (air columns)
+            const gW = Fl(rand(6, 2));              // width ~2..6 tiles
+            for (let i=0; i<gW && x<w; i++, x++) { /* leave air */ }
         }
-        return { w, h, tiles, cursed, emitters, charms };
+
+        // Emitters after skyline is built
+        emitters = buildEmitters(tiles, w, h);
+
+        return { w, h, tiles, cursed, emitters, charms, levelSeed: LEVEL_SEED };
     }
+
+
+    // Build emitters along vertical walls:
+    // pick tiles where tiles[x,y]==2 (solid), tiles[x,y-1]==2 (not the top),
+    // and either tiles[x+1,y]==0 (right face) or tiles[x-1,y]==0 (left face).
+    function buildEmitters(tiles, w, h){
+        const visMaxX = Math.min(w-2, Math.ceil(innerWidth / T) + 1);
+
+        // Roof top per column (y index of first non-air); h = street gap
+        const top = new Int16Array(visMaxX+1);
+        for (let x=0; x<=visMaxX; x++){
+            let y=0, found=false;
+            for (; y<h; y++){ if (tiles[x + y*w]) { found=true; break; } }
+            top[x] = found ? y : h;
+        }
+
+        // helper: find next non-gap building column in a direction (±1)
+        function nextBuilding(fromX, dir){
+            let x = fromX + dir;
+            while (x>=0 && x<=visMaxX){
+                if (top[x] < h) return x;
+                x += dir;
+            }
+            return -1;
+        }
+
+        const MIN_STEP = 2;        // require at least 2 tiles height diff
+        const ORG_OFF  = 0.35;     // origin offset below tall roof (tiles)
+        const TGT_OFF  = 0.35;     // aim offset above short roof (tiles)
+
+        const cand = [];
+
+        // For each building column, compare to the *next* building on each side (skip gaps)
+        for (let x=0; x<=visMaxX; x++){
+            if (top[x] === h) continue; // skip gaps themselves
+
+            // check right neighbor across any gap
+            const xr = nextBuilding(x, +1);
+            if (xr !== -1){
+                const tallY = top[x], shortY = top[xr];
+                if (tallY + MIN_STEP <= shortY){
+                    cand.push({ wallX:x, dir:+1, tallY, shortY, tgtX:xr });
+                }
+            }
+
+            // check left neighbor across any gap
+            const xl = nextBuilding(x, -1);
+            if (xl !== -1){
+                const tallY = top[x], shortY = top[xl];
+                if (tallY + MIN_STEP <= shortY){
+                    cand.push({ wallX:x, dir:-1, tallY, shortY, tgtX:xl });
+                }
+            }
+        }
+
+        // sample a handful across the width
+        const target = Math.max(3, (visMaxX/18)|0); // slightly denser
+        const chosen = [];
+        while (chosen.length < target && cand.length){
+            const k = (R()*cand.length)|0;
+            const c = cand.splice(k,1)[0];
+
+            // origin on face of the TALLER building, just below its roof cap
+            const px = (c.dir>0 ? (c.wallX+1) : c.wallX) * T;
+            const py = (c.tallY + ORG_OFF) * T;
+
+            // aim to the SHORTER neighbor’s roof center, a hair above its cap
+            const tx = (c.tgtX + 0.5) * T;
+            const ty = (c.shortY - TGT_OFF) * T;
+
+            const center = Math.atan2(ty - py, tx - px);   // guaranteed “downward” across the step
+            const dist   = Math.hypot(tx - px, ty - py);
+
+            chosen.push({
+                x:px, y:py,
+                center,
+                amp:    rand(0.16, 0.30),   // side-to-side scan amplitude (radians)
+                omega:  rand(0.6, 1.0),     // scan speed
+                spread: rand(0.85, 1.25),   // wider cone for visibility
+                len:    Math.min(420, dist + 6*T), // longer beams
+                flicker:rand(1.6, 3.0),
+                phase:  rand(0, 6.283)
+            });
+        }
+
+        console.log('emitters (taller→next-shorter across gaps):', chosen.length);
+        return chosen;
+    }
+
+
+
+
+
 
     // ===== Input =====
     const keys = {L:0,R:0,J:0,M:0};
@@ -179,9 +303,7 @@
         cat.onGround = false;
     }
 
-
     // ===== Sprite Animator =====
-    // Each sheet is frames laid out horizontally. Each frame: 20x14 px.
     const SPR_SCALE = 1; // visual scale
     const PREFIX = 'assets/';
     const ANIMS = {
@@ -207,19 +329,17 @@
         assetsReady = true;
     })();
 
-
     // Animation state machine
     let animName='Idle', animLock=0;
-    let animFrame=0, animClock=0;   // NEW: current frame + time accumulator
+    let animFrame=0, animClock=0;   // current frame + time accumulator
     const ANIM_SPEED = 0.65;        // global slow-down (65% of listed fps)
     let moveState = 'Idle';
     const TH = {
-        idleToWalk: 18,  // need to exceed this to leave Idle
-        walkToIdle: 10,  // must drop below this to return to Idle
-        walkToRun: 140,  // exceed to enter Run
-        runToWalk:  90   // drop below to leave Run
+        idleToWalk: 18,
+        walkToIdle: 10,
+        walkToRun: 140,
+        runToWalk:  90
     };
-
 
     function startAnim(name, lockSec=0){
         if (animName!==name){
@@ -239,7 +359,6 @@
             return;
         }
 
-
         const s = Math.abs(cat.vx);
         if (moveState==='Idle'){
             if (s > TH.idleToWalk) moveState = 'Walk';
@@ -252,13 +371,14 @@
         startAnim(moveState);
     }
 
-
     // ===== Game clock =====
     let last = performance.now(), acc = 0, frame = 0;
     const DT = 1/60;
+    let timeSec = 0; // for emitter flicker
 
     function update(dt){
         frame++;
+        timeSec += dt;
 
         // Meow input → play Meow (brief lock)
         if (keys.M){
@@ -275,7 +395,7 @@
         // Horizontal input
         const ax = (keys.R - keys.L) * ACC;
         cat.vx += ax * dt;
-        // friction
+        // friction + deadzone
         if (!keys.L && !keys.R) cat.vx *= cat.onGround ? 0.85 : 0.98;
         if (Math.abs(cat.vx) < 6) cat.vx = 0;
         cat.vx = clamp(cat.vx, -MAX_VX, MAX_VX);
@@ -299,16 +419,15 @@
 
         // Choose animation based on current state
         pickAnim();
-        // Advance current animation time
+        // Advance current animation frame
         const a = ANIMS[animName];
-        if (a){
-            animClock += dt * (a.fps||10) * ANIM_SPEED;
-            while (animClock >= 1){
+        if (a) {
+            animClock += dt * (a.fps || 10) * ANIM_SPEED;
+            while (animClock >= 1) {
                 animClock -= 1;
                 animFrame = (animFrame + 1) % a.frames;
             }
         }
-
     }
 
     function render(){
@@ -346,6 +465,9 @@
             }
         }
 
+        // --- Step 5: draw light cones (debug visualization) ---
+        drawEmitters();
+
         // Cat
         drawCat();
 
@@ -356,6 +478,43 @@
         ctx.font = '10px monospace';
         ctx.fillText('← → move  ↑/Z/Space jump  X meow', 12, 40);
     }
+
+    function drawEmitters(){
+        const es = world.emitters;
+        for (let i=0;i<es.length;i++){
+            const e = es[i];
+
+            // Scan around center (no 360° spin)
+            const a0   = e.center + e.amp * Sn(timeSec * e.omega + e.phase);
+            const half = e.spread * 0.5;
+            const a1 = a0 - half, a2 = a0 + half;
+
+            const len = e.len * (1 + 0.18 * Sn(timeSec * e.flicker + e.phase));
+            const x1 = e.x + Cs(a1)*len, y1 = e.y + Sn(a1)*len;
+            const x2 = e.x + Cs(a2)*len, y2 = e.y + Sn(a2)*len;
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.beginPath();
+            ctx.moveTo(e.x, e.y);
+            ctx.lineTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(255,255,210,0.22)'; // a bit brighter
+            ctx.fill();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = 'rgba(255,255,230,0.38)';
+            ctx.stroke();
+            ctx.restore();
+
+            // window dot
+            ctx.fillStyle = '#0ff';
+            ctx.fillRect(e.x-2, e.y-2, 4, 4);
+        }
+    }
+
+
+
 
     function drawCat(){
         const a = ANIMS[animName];
@@ -417,8 +576,6 @@
         }
         ctx.restore();
     }
-
-
 
     function loop(now){
         const dt = Mn(0.05, (now - last) / 1000);

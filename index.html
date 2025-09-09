@@ -12,7 +12,7 @@
     // ===== Canvas bootstrap =====
     const C = document.getElementById('c');
     const ctx = C.getContext('2d', { alpha:false });
-    const T = 8; // tile size in CSS pixels
+    const T = 8; // tile size (CSS px)
 
     function fit() {
         const dpr = Math.max(1, Math.min(3, devicePixelRatio||1));
@@ -25,21 +25,30 @@
             ctx.setTransform(dpr,0,0,dpr,0,0); // draw in CSS pixels
         }
         makeStars();        // rebuild starfield to fit new size (deterministic)
-        world = genWorld(); // rebuild rooftops for the new width/height
+        world = genWorld(); // rebuild rooftops
+        spawnCat();         // put the cat on a safe spot
     }
     addEventListener('resize', fit, { passive:true });
 
-    // ===== Utilities (Step 2) =====
-    const A=Math, Sn=A.sin, Fl=A.floor;
+    // ===== Utilities =====
+    const A=Math, Sn=A.sin, Fl=A.floor, Mn=A.min, Mx=A.max, Ab=A.abs;
     const clamp=(x,a,b)=>x<a?a:x>b?b:x;
+
+    // Sprite-to-physics alignment
+    const BODY_W = 26, BODY_H = 36; // physics hitbox (≈ sprite’s body, not full 50x50)
+    const SPRITE_FOOT_OFFSET = 18;   // you already have this; keep/tweak 0–6
+    const SPRITE_X_OFFSET = 0;     // horizontal nudge in pixels (before scaling). Start at -6, adjust ±
+    const SPRITE_Y_OFFSET = 0;      // extra vertical nudge if needed
+    const DEBUG_SPRITE_ALIGN = false; // set true briefly to visualize
+
 
     // Seeded PRNG: xorshift32
     let S=0;
     const seed=(n)=>{ S=(n|0)||1; }; // never 0
     const R=()=>{ S^=S<<13; S^=S>>>17; S^=S<<5; return (S>>>0)/4294967296; };
-    const rand=(a=1,b=0)=>b+(a-b)*R(); // float in [min,max]
+    const rand=(a=1,b=0)=>b+(a-b)*R();
 
-    // ===== Stars (deterministic, bigger) =====
+    // ===== Stars (deterministic) =====
     let stars=[];
     function makeStars(){
         seed(0xB1AC);
@@ -47,73 +56,281 @@
         stars = Array.from({length:N}, ()=>({
             x: rand(0, innerWidth),
             y: rand(0, innerHeight),
-            s: rand(2.2, 4.0),          // bigger base size
-            p: rand(0, 6.283)           // phase
+            s: rand(2.2, 4.0),
+            p: rand(0, 6.283)
         }));
     }
 
-    // ===== World / Rooftops (Step 3) =====
-    // tiles: 0=air, 1=top, 2=solid (below top)
+    // ===== World / Rooftops =====
+    // tiles: 0=air, 1=top, 2=solid
     let world=null;
 
     function genWorld(){
-        // Use a different deterministic seed so stars remain unchanged
         seed(0xB1AC ^ 0x1337);
-
-        const w = Math.ceil(innerWidth / T) + 32;         // pad offscreen a bit
-        const h = Math.max(28, Math.ceil(innerHeight / T)); // ensure enough vertical space
+        const w = Math.ceil(innerWidth / T) + 32;
+        const h = Math.max(28, Math.ceil(innerHeight / T));
         const tiles  = new Uint8Array(w*h);
-        const cursed = new Uint16Array(w*h); // placeholder for later steps
-        const emitters = [];                  // "
-        const charms = [];                    // "
+        const cursed = new Uint16Array(w*h);
+        const emitters = [];
+        const charms = [];
 
-        // Start around 2/3rds down the screen; gently drift every few columns
         let y = Fl(h * 0.65);
         for (let x=0; x<w; x++){
-            if (!(x%4)){ // every 4 tiles, nudge the skyline by -1,0,+1
+            if (!(x%4)){
                 const r = R();
                 y = clamp(y + (r<.33?-1 : r<.66?0 : 1), 8, h-6);
             }
-            // mark top tile
             tiles[x + y*w] = 1;
-            // fill solid below top
             for (let yy=y+1; yy<h; yy++) tiles[x + yy*w] = 2;
         }
         return { w, h, tiles, cursed, emitters, charms };
     }
 
+    // ===== Input =====
+    const keys = {L:0,R:0,J:0,M:0};
+    addEventListener('keydown', e=>{
+        const c=e.code;
+        if (c==='ArrowLeft' || c==='KeyA'){ keys.L=1; e.preventDefault(); }
+        if (c==='ArrowRight'|| c==='KeyD'){ keys.R=1; e.preventDefault(); }
+        if (c==='ArrowUp' || c==='KeyZ' || c==='Space'){ keys.J=1; e.preventDefault(); jumpBuffer = JUMP_BUF; }
+        if (c==='KeyX'){ keys.M=1; e.preventDefault(); }
+    });
+    addEventListener('keyup', e=>{
+        const c=e.code;
+        if (c==='ArrowLeft' || c==='KeyA'){ keys.L=0; }
+        if (c==='ArrowRight'|| c==='KeyD'){ keys.R=0; }
+        if (c==='ArrowUp' || c==='KeyZ' || c==='Space'){ keys.J=0; }
+        if (c==='KeyX'){ keys.M=0; }
+    });
+
+    // ===== Player (cat) physics =====
+    const cat = {x:0,y:0,w:BODY_W,h:BODY_H,vx:0,vy:0,onGround:false,dir:1};
+    // Tunables (pixels / second units)
+    const GRAV=1200, MAX_FALL=700, JUMP_V=380, ACC=2000, MAX_VX=200;
+    const COYOTE=0.10, JUMP_BUF=0.12;
+    let coyote=0, jumpBuffer=0;
+
+    // Spawn near the left on top of the skyline
+    function spawnCat(){
+        const tx = 6;
+        let ty = 0;
+        for (; ty<world.h; ty++) if (world.tiles[tx + ty*world.w]) break;
+        cat.x = tx*T + (T-cat.w)/2;
+        cat.y = ty*T - cat.h - 1;
+        cat.vx = cat.vy = 0;
+        cat.onGround = false; coyote=0; jumpBuffer=0;
+        cat.dir = 1;
+        // play stretch on spawn
+        startAnim('Stretching', 0.55); // ~0.55s, then auto-return to idle
+    }
+
+    // Tile helpers
+    const TI = (tx,ty)=> (tx<0||ty<0||tx>=world.w||ty>=world.h) ? 2 : world.tiles[tx + ty*world.w];
+    const solid = (tx,ty)=> TI(tx,ty)>0;
+
+    function moveX(dx){
+        if (!dx) return;
+        cat.x += dx;
+        const dir = dx>0?1:-1;
+        const xProbe = dir>0? cat.x+cat.w-1 : cat.x;
+        const tx = Fl(xProbe / T);
+        const y0 = Fl(cat.y / T), y1 = Fl((cat.y + cat.h - 1) / T);
+        for (let ty=y0; ty<=y1; ty++){
+            if (solid(tx,ty)){
+                if (dir>0) cat.x = tx*T - cat.w;
+                else       cat.x = (tx+1)*T;
+                cat.vx = 0;
+                break;
+            }
+        }
+    }
+
+    function moveY(dy){
+        if (!dy) {
+            // Standstill: set grounded based on tiles directly under the feet
+            const yBelow = Fl((cat.y + cat.h) / T);
+            const x0 = Fl(cat.x / T), x1 = Fl((cat.x + cat.w - 1) / T);
+            let grounded = false;
+            for (let tx=x0; tx<=x1; tx++){
+                if (solid(tx, yBelow)) { grounded = true; break; }
+            }
+            cat.onGround = grounded;
+            return;
+        }
+        // ---- normal vertical motion & collision ----
+        cat.y += dy;
+        const dir = dy>0?1:-1;
+        const yProbe = dir>0? cat.y+cat.h-1 : cat.y;
+        const ty = Fl(yProbe / T);
+        const x0 = Fl(cat.x / T), x1 = Fl((cat.x + cat.w - 1) / T);
+        for (let tx=x0; tx<=x1; tx++){
+            if (solid(tx,ty)){
+                if (dir>0){ // falling
+                    cat.y = ty*T - cat.h;
+                    cat.vy = 0;
+                    cat.onGround = true;
+                } else {    // head bump
+                    cat.y = (ty+1)*T;
+                    cat.vy = 0;
+                }
+                return;
+            }
+        }
+        cat.onGround = false;
+    }
+
+
+    // ===== Sprite Animator =====
+    // Each sheet is frames laid out horizontally. Each frame: 20x14 px.
+    const SPR_SCALE = 1; // visual scale
+    const PREFIX = 'assets/';
+    const ANIMS = {
+        Idle:{file:PREFIX+'Cat-2-Idle.png',frames:10,fps:6},
+        Walk:{file:PREFIX+'Cat-2-Walk.png',frames:8,fps:10},
+        Run:{file:PREFIX+'Cat-2-Run.png',frames:8,fps:12},
+        Meow:{file:PREFIX+'Cat-2-Meow.png',frames:4,fps:8},
+        Laying:{file:PREFIX+'Cat-2-Laying.png',frames:8,fps:10},
+        Stretching:{file:PREFIX+'Cat-2-Stretching.png',frames:13,fps:9},
+    };
+
+    // Preload
+    const sheets = {};
+    let assetsReady = false;
+    (async function preload(){
+        const loads = Object.entries(ANIMS).map(([k,v])=> new Promise(res=>{
+            const img = new Image();
+            img.onload = ()=>{ console.log('Loaded:', v.file, img.width+'x'+img.height); sheets[k]=img; res(); };
+            img.onerror = (e)=>{ console.error('FAILED to load:', v.file, e); res(); };
+            img.src = v.file;
+        }));
+        await Promise.all(loads);
+        assetsReady = true;
+    })();
+
+
+    // Animation state machine
+    let animName='Idle', animLock=0;
+    let animFrame=0, animClock=0;   // NEW: current frame + time accumulator
+    const ANIM_SPEED = 0.65;        // global slow-down (65% of listed fps)
+    let moveState = 'Idle';
+    const TH = {
+        idleToWalk: 18,  // need to exceed this to leave Idle
+        walkToIdle: 10,  // must drop below this to return to Idle
+        walkToRun: 140,  // exceed to enter Run
+        runToWalk:  90   // drop below to leave Run
+    };
+
+
+    function startAnim(name, lockSec=0){
+        if (animName!==name){
+            animName = name;
+            animFrame = 0;
+            animClock = 0;
+        }
+        animLock = Math.max(animLock, lockSec||0);
+    }
+
+    function pickAnim(){
+        if (animLock>0) return;
+
+        if (!cat.onGround){
+            const s = Math.abs(cat.vx);
+            startAnim(s>120 ? 'Run' : (s>10 ? 'Walk' : 'Idle'));
+            return;
+        }
+
+
+        const s = Math.abs(cat.vx);
+        if (moveState==='Idle'){
+            if (s > TH.idleToWalk) moveState = 'Walk';
+        } else if (moveState==='Walk'){
+            if (s > TH.walkToRun)      moveState = 'Run';
+            else if (s < TH.walkToIdle) moveState = 'Idle';
+        } else if (moveState==='Run'){
+            if (s < TH.runToWalk) moveState = 'Walk';
+        }
+        startAnim(moveState);
+    }
+
+
     // ===== Game clock =====
     let last = performance.now(), acc = 0, frame = 0;
-    const DT = 1/60; // seconds
+    const DT = 1/60;
 
     function update(dt){
         frame++;
-        // (No gameplay yet)
+
+        // Meow input → play Meow (brief lock)
+        if (keys.M){
+            startAnim('Meow', 0.35); // ~0.35s lock
+            keys.M=0; // one-shot
+        }
+
+        // Timers
+        animLock = Mx(0, animLock - dt);
+        coyote = Mn(coyote + (cat.onGround? (COYOTE - coyote) : -dt), COYOTE);
+        if (!cat.onGround) coyote = Mx(0, coyote - dt);
+        jumpBuffer = Mx(0, jumpBuffer - dt);
+
+        // Horizontal input
+        const ax = (keys.R - keys.L) * ACC;
+        cat.vx += ax * dt;
+        // friction
+        if (!keys.L && !keys.R) cat.vx *= cat.onGround ? 0.85 : 0.98;
+        if (Math.abs(cat.vx) < 6) cat.vx = 0;
+        cat.vx = clamp(cat.vx, -MAX_VX, MAX_VX);
+        if (Ab(cat.vx)>1) cat.dir = cat.vx>0 ? 1 : -1;
+
+        // Jump if buffered and allowed (ground or within coyote)
+        if (jumpBuffer > 0 && (cat.onGround || coyote>0)){
+            cat.vy = -JUMP_V;
+            jumpBuffer = 0; coyote = 0; cat.onGround = false;
+        }
+
+        // Gravity
+        cat.vy = Mn(cat.vy + GRAV*dt, MAX_FALL);
+
+        // Integrate & collide (separate axes)
+        moveX(cat.vx * dt);
+        moveY(cat.vy * dt);
+
+        // Keep within world bounds horizontally
+        cat.x = clamp(cat.x, 0, world.w*T - cat.w);
+
+        // Choose animation based on current state
+        pickAnim();
+        // Advance current animation time
+        const a = ANIMS[animName];
+        if (a){
+            animClock += dt * (a.fps||10) * ANIM_SPEED;
+            while (animClock >= 1){
+                animClock -= 1;
+                animFrame = (animFrame + 1) % a.frames;
+            }
+        }
+
     }
 
     function render(){
-        // Clear background
+        // Background
         ctx.clearRect(0,0,innerWidth,innerHeight);
         ctx.fillStyle = '#000'; ctx.fillRect(0,0,innerWidth,innerHeight);
 
-        // Starfield
+        // Stars
         const t = performance.now()*0.001;
         for (let i=0;i<stars.length;i++){
             const st = stars[i];
-            const tw = .7 + .6*Sn(t*2.2 + st.p); // twinkle
+            const tw = .7 + .6*Sn(t*2.2 + st.p);
             const r  = st.s * tw;
             ctx.fillStyle = '#888';
             ctx.fillRect(st.x - r/2, st.y - r/2, r, r);
         }
 
-        // Rooftops (draw column-wise for fewer draw calls)
+        // Rooftops
         if (world){
             const {w,h,tiles} = world;
-
-            // Fill solids
             ctx.fillStyle = '#111';
             for (let x=0; x<w; x++){
-                // find top y for this column
                 let y=0, found=false;
                 for (; y<h; y++){ if (tiles[x + y*w]) { found=true; break; } }
                 if (found){
@@ -121,25 +338,90 @@
                     ctx.fillRect(x*T, ypx, T, h*T - ypx);
                 }
             }
-            // Top-edge highlight
             ctx.fillStyle = '#222';
             for (let x=0; x<w; x++){
                 for (let y=0; y<h; y++){
-                    if (tiles[x + y*w] === 1){
-                        ctx.fillRect(x*T, y*T, T, 2); // thin highlight line
-                        break;
-                    }
+                    if (tiles[x + y*w] === 1){ ctx.fillRect(x*T, y*T, T, 2); break; }
                 }
             }
         }
 
-        // Little pulse bar
+        // Cat
+        drawCat();
+
+        // Tiny HUD/help
         ctx.fillStyle = '#444';
         ctx.fillRect(12, 12, 80, 6 + 4*Sn(t*2));
+        ctx.fillStyle = '#777';
+        ctx.font = '10px monospace';
+        ctx.fillText('← → move  ↑/Z/Space jump  X meow', 12, 40);
     }
 
+    function drawCat(){
+        const a = ANIMS[animName];
+        const img = sheets[animName];
+
+        // Common anchors
+        const drawX = (cat.x + cat.w/2)|0;
+
+        // Placeholder while assets load — uses SAME alignment logic
+        if (!assetsReady || !img){
+            const fw = 50, fh = 50;                      // your frames are 50x50
+            const w  = fw * SPR_SCALE, h = fh * SPR_SCALE;
+            const drawY = ((cat.y + cat.h) - h + SPRITE_FOOT_OFFSET + SPRITE_Y_OFFSET)|0;
+            const dir = cat.dir < 0 ? -1 : 1;
+            const oX  = (SPRITE_X_OFFSET * SPR_SCALE) * dir;
+
+            if (DEBUG_SPRITE_ALIGN){
+                ctx.strokeStyle = '#0f0';
+                ctx.strokeRect(cat.x|0, cat.y|0, cat.w|0, cat.h|0); // physics box
+            }
+
+            ctx.save();
+            ctx.translate(drawX, drawY);
+            if (dir < 0) ctx.scale(-1, 1);               // flip around anchor
+            ctx.fillStyle = '#e6e6e6';
+            ctx.fillRect(-w/2 + oX, 0, w, h);
+            if (DEBUG_SPRITE_ALIGN){
+                ctx.strokeStyle = '#f0f';
+                ctx.strokeRect(-w/2 + oX, 0, w, h);        // sprite rect
+            }
+            ctx.restore();
+            return;
+        }
+
+        // Real sprite
+        const f = animFrame | 0;
+        const fw  = (img.width / a.frames) | 0;
+        const fh  = img.height | 0;
+        const w   = fw * SPR_SCALE, h = fh * SPR_SCALE;
+        const sx  = f * fw, sy = 0;
+
+        const drawY = ((cat.y + cat.h) - h + SPRITE_FOOT_OFFSET + SPRITE_Y_OFFSET)|0;
+        const dir   = cat.dir < 0 ? -1 : 1;
+        const oX    = (SPRITE_X_OFFSET * SPR_SCALE) * dir;
+
+        if (DEBUG_SPRITE_ALIGN){
+            ctx.strokeStyle = '#0f0';
+            ctx.strokeRect(cat.x|0, cat.y|0, cat.w|0, cat.h|0);   // physics box
+        }
+
+        ctx.save();
+        ctx.translate(drawX, drawY);
+        if (dir < 0) ctx.scale(-1, 1);               // flip around anchor (no translate(w,0))
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(img, sx, sy, fw, fh, -w/2 + oX, 0, w, h);
+        if (DEBUG_SPRITE_ALIGN){
+            ctx.strokeStyle = '#f0f';
+            ctx.strokeRect(-w/2 + oX, 0, w, h);        // sprite rect
+        }
+        ctx.restore();
+    }
+
+
+
     function loop(now){
-        const dt = Math.min(0.05, (now - last) / 1000);
+        const dt = Mn(0.05, (now - last) / 1000);
         last = now; acc += dt;
         while (acc >= DT) { update(DT); acc -= DT; }
         render();

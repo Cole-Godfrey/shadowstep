@@ -9,53 +9,145 @@
 </style>
 <canvas id="c"></canvas>
 <script>
-    // grab canvas + context
+    // ===== Canvas bootstrap =====
     const C = document.getElementById('c');
     const ctx = C.getContext('2d', { alpha:false });
+    const T = 8; // tile size in CSS pixels
 
-    // resize (handles HiDPI)
     function fit() {
-        const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1)); // clamp to keep perf
+        const dpr = Math.max(1, Math.min(3, devicePixelRatio||1));
         const w = Math.floor(innerWidth  * dpr);
         const h = Math.floor(innerHeight * dpr);
         if (C.width !== w || C.height !== h) {
             C.width = w; C.height = h;
             C.style.width  = innerWidth + 'px';
             C.style.height = innerHeight + 'px';
-            ctx.setTransform(dpr,0,0,dpr,0,0); // logical units = CSS pixels
+            ctx.setTransform(dpr,0,0,dpr,0,0); // draw in CSS pixels
         }
+        makeStars();        // rebuild starfield to fit new size (deterministic)
+        world = genWorld(); // rebuild rooftops for the new width/height
     }
     addEventListener('resize', fit, { passive:true });
-    fit();
 
-    // minimal game loop (fixed step update, free render)
+    // ===== Utilities (Step 2) =====
+    const A=Math, Sn=A.sin, Fl=A.floor;
+    const clamp=(x,a,b)=>x<a?a:x>b?b:x;
+
+    // Seeded PRNG: xorshift32
+    let S=0;
+    const seed=(n)=>{ S=(n|0)||1; }; // never 0
+    const R=()=>{ S^=S<<13; S^=S>>>17; S^=S<<5; return (S>>>0)/4294967296; };
+    const rand=(a=1,b=0)=>b+(a-b)*R(); // float in [min,max]
+
+    // ===== Stars (deterministic, bigger) =====
+    let stars=[];
+    function makeStars(){
+        seed(0xB1AC);
+        const N = 180;
+        stars = Array.from({length:N}, ()=>({
+            x: rand(0, innerWidth),
+            y: rand(0, innerHeight),
+            s: rand(2.2, 4.0),          // bigger base size
+            p: rand(0, 6.283)           // phase
+        }));
+    }
+
+    // ===== World / Rooftops (Step 3) =====
+    // tiles: 0=air, 1=top, 2=solid (below top)
+    let world=null;
+
+    function genWorld(){
+        // Use a different deterministic seed so stars remain unchanged
+        seed(0xB1AC ^ 0x1337);
+
+        const w = Math.ceil(innerWidth / T) + 32;         // pad offscreen a bit
+        const h = Math.max(28, Math.ceil(innerHeight / T)); // ensure enough vertical space
+        const tiles  = new Uint8Array(w*h);
+        const cursed = new Uint16Array(w*h); // placeholder for later steps
+        const emitters = [];                  // "
+        const charms = [];                    // "
+
+        // Start around 2/3rds down the screen; gently drift every few columns
+        let y = Fl(h * 0.65);
+        for (let x=0; x<w; x++){
+            if (!(x%4)){ // every 4 tiles, nudge the skyline by -1,0,+1
+                const r = R();
+                y = clamp(y + (r<.33?-1 : r<.66?0 : 1), 8, h-6);
+            }
+            // mark top tile
+            tiles[x + y*w] = 1;
+            // fill solid below top
+            for (let yy=y+1; yy<h; yy++) tiles[x + yy*w] = 2;
+        }
+        return { w, h, tiles, cursed, emitters, charms };
+    }
+
+    // ===== Game clock =====
     let last = performance.now(), acc = 0, frame = 0;
     const DT = 1/60; // seconds
 
-    function update(dt) {
-        // placeholder: advance a frame counter (for future use)
+    function update(dt){
         frame++;
+        // (No gameplay yet)
     }
 
-    function render() {
-        // clear (background already black because alpha:false, but keep explicit)
+    function render(){
+        // Clear background
         ctx.clearRect(0,0,innerWidth,innerHeight);
+        ctx.fillStyle = '#000'; ctx.fillRect(0,0,innerWidth,innerHeight);
 
-        // optional tiny heartbeat so you can see it’s animating
-        const t = performance.now() * 0.002;
-        ctx.fillStyle = '#111';
-        ctx.fillRect(0, 0, innerWidth, innerHeight); // solid black
+        // Starfield
+        const t = performance.now()*0.001;
+        for (let i=0;i<stars.length;i++){
+            const st = stars[i];
+            const tw = .7 + .6*Sn(t*2.2 + st.p); // twinkle
+            const r  = st.s * tw;
+            ctx.fillStyle = '#888';
+            ctx.fillRect(st.x - r/2, st.y - r/2, r, r);
+        }
+
+        // Rooftops (draw column-wise for fewer draw calls)
+        if (world){
+            const {w,h,tiles} = world;
+
+            // Fill solids
+            ctx.fillStyle = '#111';
+            for (let x=0; x<w; x++){
+                // find top y for this column
+                let y=0, found=false;
+                for (; y<h; y++){ if (tiles[x + y*w]) { found=true; break; } }
+                if (found){
+                    const ypx = y*T;
+                    ctx.fillRect(x*T, ypx, T, h*T - ypx);
+                }
+            }
+            // Top-edge highlight
+            ctx.fillStyle = '#222';
+            for (let x=0; x<w; x++){
+                for (let y=0; y<h; y++){
+                    if (tiles[x + y*w] === 1){
+                        ctx.fillRect(x*T, y*T, T, 2); // thin highlight line
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Little pulse bar
         ctx.fillStyle = '#444';
-        ctx.fillRect(12, 12, 80, 6 + 4*Math.sin(t)); // a subtle pulsing bar
+        ctx.fillRect(12, 12, 80, 6 + 4*Sn(t*2));
     }
 
-    function loop(now) {
+    function loop(now){
         const dt = Math.min(0.05, (now - last) / 1000);
         last = now; acc += dt;
         while (acc >= DT) { update(DT); acc -= DT; }
         render();
         requestAnimationFrame(loop);
     }
+
+    // boot
+    fit();
     requestAnimationFrame(loop);
 </script>
 </html>

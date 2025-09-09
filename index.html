@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Black Cat — Skeleton</title>
+<style>
+    html,body{margin:0;height:100%;background:#000;overflow:hidden}
+    canvas{display:block;touch-action:none}
+</style>
+<canvas id="c"></canvas>
+<script>
+    // grab canvas + context
+    const C = document.getElementById('c');
+    const ctx = C.getContext('2d', { alpha:false });
+
+    // resize (handles HiDPI)
+    function fit() {
+        const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1)); // clamp to keep perf
+        const w = Math.floor(innerWidth  * dpr);
+        const h = Math.floor(innerHeight * dpr);
+        if (C.width !== w || C.height !== h) {
+            C.width = w; C.height = h;
+            C.style.width  = innerWidth + 'px';
+            C.style.height = innerHeight + 'px';
+            ctx.setTransform(dpr,0,0,dpr,0,0); // logical units = CSS pixels
+        }
+    }
+    addEventListener('resize', fit, { passive:true });
+    fit();
+
+    // minimal game loop (fixed step update, free render)
+    let last = performance.now(), acc = 0, frame = 0;
+    const DT = 1/60; // seconds
+
+    function update(dt) {
+        // placeholder: advance a frame counter (for future use)
+        frame++;
+    }
+
+    function render() {
+        // clear (background already black because alpha:false, but keep explicit)
+        ctx.clearRect(0,0,innerWidth,innerHeight);
+
+        // optional tiny heartbeat so you can see it’s animating
+        const t = performance.now() * 0.002;
+        ctx.fillStyle = '#111';
+        ctx.fillRect(0, 0, innerWidth, innerHeight); // solid black
+        ctx.fillStyle = '#444';
+        ctx.fillRect(12, 12, 80, 6 + 4*Math.sin(t)); // a subtle pulsing bar
+    }
+
+    function loop(now) {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now; acc += dt;
+        while (acc >= DT) { update(DT); acc -= DT; }
+        render();
+        requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+</script>
+</html>

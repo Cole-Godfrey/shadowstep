@@ -43,18 +43,45 @@
 
     const clamp=(x,a,b)=>x<a?a:x>b?b:x;
 
+    // ===== Camera =====
+    const cam = { x: 0, y: 0, lerp: 6, zoom: 3 }; // ↑ bigger = closer
+
+    const elerp = (cur, target, rate, dt) =>
+        cur + (target - cur) * (1 - Math.pow(0.001, rate * dt));
+
+    function updateCamera(dt){
+        if (!world) return;
+
+        // visible world size shrinks when zoomed in
+        const vw = innerWidth  / cam.zoom;
+        const vh = innerHeight / cam.zoom;
+
+        const maxX = Math.max(0, world.w*T - vw);
+        const maxY = Math.max(0, world.h*T - vh);
+
+        const tgtX = clamp(cat.x + cat.w*0.5 - vw * 0.5, 0, maxX);
+        const tgtY = clamp(cat.y + cat.h*0.5 - vh * 0.5, 0, maxY); // 0.6 shows a bit ahead
+
+        cam.x = elerp(cam.x, tgtX, cam.lerp, dt);
+        cam.y = elerp(cam.y, tgtY, cam.lerp, dt);
+    }
+
+
+
     // Sprite-to-physics alignment
-    const BODY_W = 26, BODY_H = 36; // physics hitbox (≈ sprite’s body, not full 50x50)
+    const BODY_W = 15, BODY_H = 13; // physics hitbox (≈ sprite’s body, not full 50x50)
     const SPRITE_FOOT_OFFSET = 18
     const SPRITE_X_OFFSET = 0;
     const SPRITE_Y_OFFSET = 0;
-    const DEBUG_SPRITE_ALIGN = false; // turn on if you need to re-align
+    const DEBUG_SPRITE_ALIGN = true; // turn on if you need to re-align
 
     // Seeded PRNG: xorshift32
     let S=0;
     const seed=(n)=>{ S=(n|0)||1; }; // never 0
     const R=()=>{ S^=S<<13; S^=S>>>17; S^=S<<5; return (S>>>0)/4294967296; };
     const rand=(a=1,b=0)=>b+(a-b)*R();
+
+
 
     // ===== Stars (deterministic) =====
     let stars=[];
@@ -194,9 +221,9 @@
                 center,
                 amp:    rand(0.16, 0.30),   // side-to-side scan amplitude (radians)
                 omega:  rand(0.6, 1.0),     // scan speed
-                spread: rand(0.85, 1.25),   // wider cone for visibility
+                spread: rand(0.25, 0.40),   // wider cone for visibility
                 len:    Math.min(420, dist + 6*T), // longer beams
-                flicker:rand(1.6, 3.0),
+                flicker:rand(0.4, 1.0),
                 phase:  rand(0, 6.283)
             });
         }
@@ -249,8 +276,14 @@
     }
 
     // Tile helpers
-    const TI = (tx,ty)=> (tx<0||ty<0||tx>=world.w||ty>=world.h) ? 2 : world.tiles[tx + ty*world.w];
+    const TI = (tx,ty)=>{
+        if (tx<0 || tx>=world.w) return 2;   // solid side walls
+        if (ty<0)                return 2;   // solid ceiling
+        if (ty>=world.h)         return 0;   // NO floor below world → free fall
+        return world.tiles[tx + ty*world.w];
+    };
     const solid = (tx,ty)=> TI(tx,ty)>0;
+
 
     function moveX(dx){
         if (!dx) return;
@@ -371,6 +404,56 @@
         startAnim(moveState);
     }
 
+    // ==== Light detection, death, and respawn ====
+    const KILL_EXPOSE  = 0.05; // seconds required in light
+    const RESPAWN_TIME = 1.10; // seconds until respawn
+
+    let lightT   = 0;          // current continuous exposure time
+    let dying    = false;      // death state flag
+    let deathT   = 0;          // timer while dying
+    let killerIdx= -1;         // which emitter caught the cat
+    let deaths   = 0;          // counter to display
+
+    const catCenter = ()=>({ cx: cat.x + cat.w*0.5, cy: cat.y + cat.h*0.5 });
+    const angDiff = (a,b)=>{ let d=a-b; while(d>Math.PI)d-=6.283185307179586; while(d<-Math.PI)d+=6.283185307179586; return d; };
+
+    // Returns the index of the first emitter whose cone currently contains the cat, or -1.
+    function firstLitEmitter(){
+        if (!world || !world.emitters) return -1;
+        const {cx,cy} = catCenter();
+        for (let i=0; i<world.emitters.length; i++){
+            const e = world.emitters[i];
+
+            // same scan math used in drawEmitters()
+            const a0   = e.center + e.amp * Sn(timeSec * e.omega + e.phase);
+            const half = e.spread * 0.5;
+
+            const flick = 0.5 + 0.5 * Sn(timeSec * e.flicker + e.phase); // 0..1
+            const len   = e.len * (0.88 + 0.28 * flick);
+
+            const dx = cx - e.x, dy = cy - e.y;
+            const r  = Math.hypot(dx, dy);
+            if (r > len) continue;
+
+            const ang = Math.atan2(dy, dx);
+            if (Math.abs(angDiff(ang, a0)) <= half) return i;
+        }
+        return -1;
+    }
+
+    function kill(reason='light', idx=-1){
+        if (dying) return;
+        dying     = true;
+        deathT    = 0;
+        lightT    = 0;
+        killerIdx = (reason==='light') ? idx : -1;
+        jumpBuffer= 0;       // prevent buffered jump from firing
+        cat.vx    = 0;       // freeze horizontal
+        startAnim('Laying', 10); // lock animation during death
+    }
+
+
+
     // ===== Game clock =====
     let last = performance.now(), acc = 0, frame = 0;
     const DT = 1/60;
@@ -379,9 +462,11 @@
     function update(dt){
         frame++;
         timeSec += dt;
+        if (dying){ keys.L=0; keys.R=0; keys.J=0; }
+
 
         // Meow input → play Meow (brief lock)
-        if (keys.M){
+        if (keys.M && !dying){
             startAnim('Meow', 0.35); // ~0.35s lock
             keys.M=0; // one-shot
         }
@@ -393,16 +478,20 @@
         jumpBuffer = Mx(0, jumpBuffer - dt);
 
         // Horizontal input
-        const ax = (keys.R - keys.L) * ACC;
-        cat.vx += ax * dt;
-        // friction + deadzone
-        if (!keys.L && !keys.R) cat.vx *= cat.onGround ? 0.85 : 0.98;
-        if (Math.abs(cat.vx) < 6) cat.vx = 0;
+        if (!dying) {
+            const ax = (keys.R - keys.L) * ACC;
+            cat.vx += ax * dt;
+            // friction + deadzone
+            if (!keys.L && !keys.R) cat.vx *= cat.onGround ? 0.85 : 0.98;
+            if (Math.abs(cat.vx) < 6) cat.vx = 0;
+        } else {
+            cat.vx *= 0.90
+        }
         cat.vx = clamp(cat.vx, -MAX_VX, MAX_VX);
         if (Ab(cat.vx)>1) cat.dir = cat.vx>0 ? 1 : -1;
 
         // Jump if buffered and allowed (ground or within coyote)
-        if (jumpBuffer > 0 && (cat.onGround || coyote>0)){
+        if (!dying && jumpBuffer > 0 && (cat.onGround || coyote>0)){
             cat.vy = -JUMP_V;
             jumpBuffer = 0; coyote = 0; cat.onGround = false;
         }
@@ -414,11 +503,35 @@
         moveX(cat.vx * dt);
         moveY(cat.vy * dt);
 
+        if (!dying && cat.y > world.h * T + 8){
+            kill('fall');
+        }
+
+
         // Keep within world bounds horizontally
         cat.x = clamp(cat.x, 0, world.w*T - cat.w);
+        updateCamera(dt);
 
-        // Choose animation based on current state
-        pickAnim();
+        // === Light catch logic ===
+        if (!dying){
+            const hit = firstLitEmitter();
+            if (hit >= 0) { lightT += dt; killerIdx = hit; } else { lightT = 0; killerIdx = -1; }
+            if (lightT > KILL_EXPOSE){
+                kill('light', killerIdx)
+            }
+        } else {
+            deathT += dt; // let gravity settle the body if midair
+            if (deathT >= RESPAWN_TIME){
+                deaths++;
+                dying = false; deathT = 0; lightT = 0; killerIdx = -1;
+                spawnCat(); // respawn with your existing intro animation
+            }
+        }
+
+
+        // Choose animation based on current state (unless dying)
+        if (!dying) pickAnim();
+
         // Advance current animation frame
         const a = ANIMS[animName];
         if (a) {
@@ -431,11 +544,11 @@
     }
 
     function render(){
-        // Background
+        // Screen-space background
         ctx.clearRect(0,0,innerWidth,innerHeight);
         ctx.fillStyle = '#000'; ctx.fillRect(0,0,innerWidth,innerHeight);
 
-        // Stars
+        // Stars (screen space)
         const t = performance.now()*0.001;
         for (let i=0;i<stars.length;i++){
             const st = stars[i];
@@ -444,6 +557,11 @@
             ctx.fillStyle = '#888';
             ctx.fillRect(st.x - r/2, st.y - r/2, r, r);
         }
+
+        // === WORLD SPACE ===
+        ctx.save();
+        ctx.scale(cam.zoom, cam.zoom)
+        ctx.translate(-cam.x, -cam.y);
 
         // Rooftops
         if (world){
@@ -465,52 +583,85 @@
             }
         }
 
-        // --- Step 5: draw light cones (debug visualization) ---
+        // Beams + Cat in world space
         drawEmitters();
-
-        // Cat
         drawCat();
 
-        // Tiny HUD/help
+        ctx.restore();
+        // === END WORLD SPACE ===
+
+        // HUD (screen space)
         ctx.fillStyle = '#444';
         ctx.fillRect(12, 12, 80, 6 + 4*Sn(t*2));
         ctx.fillStyle = '#777';
         ctx.font = '10px monospace';
         ctx.fillText('← → move  ↑/Z/Space jump  X meow', 12, 40);
+
+        ctx.font = '12px monospace';
+        ctx.fillStyle = '#ddd';
+        ctx.textAlign = 'right';
+        ctx.fillText('Deaths: ' + deaths, innerWidth - 12, 18);
+        ctx.textAlign = 'left';
     }
+
 
     function drawEmitters(){
         const es = world.emitters;
         for (let i=0;i<es.length;i++){
             const e = es[i];
+            const isKiller = dying && i===killerIdx;
 
-            // Scan around center (no 360° spin)
-            const a0   = e.center + e.amp * Sn(timeSec * e.omega + e.phase);
-            const half = e.spread * 0.5;
+            // Base scan params
+            let a0   = e.center + e.amp * Sn(timeSec * e.omega + e.phase);
+            let half = e.spread * 0.5;
+            let flick= 0.5 + 0.5 * Sn(timeSec * e.flicker + e.phase); // 0..1
+            let len  = e.len * (0.88 + 0.28 * flick);
+
+            // When caught: hard-focus on cat, max brightness, tighter cone, ensure reach
+            if (isKiller){
+                const {cx,cy} = catCenter();
+                a0   = Math.atan2(cy - e.y, cx - e.x);
+                half = half * 0.25;                 // tighten the beam
+                flick= 1.0;                         // max brightness
+                len  = Math.hypot(cx - e.x, cy - e.y) + 40; // reach past the cat
+            }
+
             const a1 = a0 - half, a2 = a0 + half;
-
-            const len = e.len * (1 + 0.18 * Sn(timeSec * e.flicker + e.phase));
             const x1 = e.x + Cs(a1)*len, y1 = e.y + Sn(a1)*len;
             const x2 = e.x + Cs(a2)*len, y2 = e.y + Sn(a2)*len;
 
             ctx.save();
             ctx.globalCompositeOperation = 'lighter';
+
+            // soft bulb glow (also flickers)
+            ctx.beginPath();
+            ctx.arc(e.x, e.y, 2 + 2*flick, 0, 6.283);
+            ctx.fillStyle = `rgba(255,240,180,${0.12 + 0.25*flick})`;
+            ctx.fill();
+
+            // cone
             ctx.beginPath();
             ctx.moveTo(e.x, e.y);
             ctx.lineTo(x1, y1);
             ctx.lineTo(x2, y2);
             ctx.closePath();
-            ctx.fillStyle = 'rgba(255,255,210,0.22)'; // a bit brighter
+
+            let aFill   = 0.08 + 0.24 * flick;
+            let aStroke = 0.16 + 0.28 * flick;
+            if (isKiller){ aFill = 0.65; aStroke = 0.95; } // punch up when caught
+
+            ctx.fillStyle   = `rgba(255,255,210,${aFill})`;
             ctx.fill();
-            ctx.lineWidth = 1;
-            ctx.strokeStyle = 'rgba(255,255,230,0.38)';
+            ctx.lineWidth   = 1;
+            ctx.strokeStyle = `rgba(255,255,230,${aStroke})`;
             ctx.stroke();
             ctx.restore();
 
             // window dot
-            ctx.fillStyle = '#0ff';
+            ctx.fillStyle = '#DAE03A';
             ctx.fillRect(e.x-2, e.y-2, 4, 4);
         }
+
     }
 
 
